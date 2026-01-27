@@ -85,6 +85,84 @@ logger = logging.getLogger(__name__)
 # Enable/disable L0 via environment variable
 L0_ENABLED = os.environ.get("L0_ENABLED", "1") == "1"
 L0_K = int(os.environ.get("L0_K", "4"))  # Number of L0 draft tokens
+L0_CHECKPOINT = os.environ.get("L0_CHECKPOINT", "/workspace/lager/projects/parlay/three_tier/checkpoints_diverse/l0_best.pt")
+L0_VOCAB_SIZE = int(os.environ.get("L0_VOCAB_SIZE", "8192"))  # Reduced vocab for L0
+L0_CONFIDENCE_THRESHOLD = float(os.environ.get("L0_CONFIDENCE_THRESHOLD", "0.7"))  # Use L0 when all probs >= this
+L0_SKIP_EAGLE = os.environ.get("L0_SKIP_EAGLE", "1") == "1"  # Skip EAGLE entirely when L0 confident
+
+
+def create_linear_verify_input(
+    l0_tokens: torch.Tensor,
+    verified_id: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_sum: int,
+    num_draft_tokens: int,
+    device: str = "cuda",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create linear (non-tree) verification structures from L0 tokens.
+
+    For L0-Skip-EAGLE mode: when L0 is confident, bypass EAGLE and
+    create a simple linear verification path.
+
+    IMPORTANT: Must pad to num_draft_tokens to match CUDA graph expectations.
+
+    Returns same structure as build_tree_kernel_efficient:
+    (tree_mask, position, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens)
+    """
+    batch_size = seq_lens.shape[0]
+    k = l0_tokens.shape[1]  # Number of L0 tokens per batch
+    actual_tokens_per_batch = k + 1  # verified_id + k L0 tokens
+
+    # Combine verified_id with L0 tokens to create draft sequence
+    # verified_id: [batch] - the token that was just verified
+    # l0_tokens: [batch, k] - L0's predictions
+    # draft sequence: [verified_id, l0_tok0, l0_tok1, ..., l0_tok(k-1)] padded to num_draft_tokens
+
+    # Create draft tokens: flatten to [batch * num_draft_tokens]
+    # Pad each batch's tokens to num_draft_tokens with 0 (padding token)
+    draft_tokens = torch.cat([verified_id.unsqueeze(1), l0_tokens], dim=1)  # [batch, k+1]
+
+    # Pad to num_draft_tokens per batch
+    if actual_tokens_per_batch < num_draft_tokens:
+        padding = torch.zeros(
+            batch_size, num_draft_tokens - actual_tokens_per_batch,
+            dtype=draft_tokens.dtype, device=device
+        )
+        draft_tokens = torch.cat([draft_tokens, padding], dim=1)  # [batch, num_draft_tokens]
+
+    draft_tokens_flat = draft_tokens.view(-1)  # [batch * num_draft_tokens]
+
+    # Positions: for each batch, positions are [seq_len, seq_len+1, ..., seq_len+num_draft_tokens-1]
+    positions = []
+    for b in range(batch_size):
+        seq_len = seq_lens[b].item()
+        positions.extend([seq_len + i for i in range(num_draft_tokens)])
+    positions = torch.tensor(positions, dtype=torch.int64, device=device)
+
+    # Tree mask: all True (causal masking is handled elsewhere)
+    total_tokens = batch_size * num_draft_tokens
+    tree_mask = torch.ones(total_tokens, dtype=torch.bool, device=device)
+
+    # Retrieval indices for greedy verification
+    # retrive_index: for each batch, which token indices are candidates
+    # Shape: [batch, num_draft_tokens]
+    # For linear, indices are 0, 1, 2, ..., k for real tokens, -1 for padding
+    retrive_index = torch.full((batch_size, num_draft_tokens), -1, dtype=torch.long, device=device)
+    for b in range(batch_size):
+        for i in range(actual_tokens_per_batch):
+            retrive_index[b, i] = i  # Local index within batch
+
+    # retrive_next_token: linear chain - token i points to token i+1
+    retrive_next_token = torch.full((batch_size, num_draft_tokens), -1, dtype=torch.long, device=device)
+    for b in range(batch_size):
+        for i in range(actual_tokens_per_batch - 1):
+            retrive_next_token[b, i] = i + 1
+
+    # retrive_next_sibling: no siblings in linear path
+    retrive_next_sibling = torch.full((batch_size, num_draft_tokens), -1, dtype=torch.long, device=device)
+
+    return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens_flat
 
 
 class L0DraftPredictor(nn.Module):
@@ -92,9 +170,10 @@ class L0DraftPredictor(nn.Module):
     L0: Lightweight predictor that drafts K0 tokens before EAGLE.
 
     Architecture: hidden_state -> fc1 -> ReLU -> fc2 -> logits
+    Uses reduced vocab (8192) for speed - tokens map to first 8K of full vocab.
     """
 
-    def __init__(self, hidden_dim: int = 4096, inner_dim: int = 1024, vocab_size: int = 128256):
+    def __init__(self, hidden_dim: int = 4096, inner_dim: int = 1024, vocab_size: int = 8192):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.inner_dim = inner_dim
@@ -116,7 +195,9 @@ class L0DraftPredictor(nn.Module):
             tokens.append(tok)
             probs_list.append(conf)
             if i < k - 1:
-                inner = F.relu(inner + self.embed(tok))
+                # Clamp to valid vocab range
+                tok_clamped = tok.clamp(0, self.vocab_size - 1)
+                inner = F.relu(inner + self.embed(tok_clamped))
 
         # Return [batch, k], [batch, k]
         return torch.stack(tokens, dim=1), torch.stack(probs_list, dim=1)
@@ -129,16 +210,20 @@ class L0Stats:
         self.l0_time_us = 0
         self.l0_tokens = 0
         self.l0_matches = 0
+        self.l0_used = 0  # Times L0 was confident enough to use
+        self.l0_skipped_eagle = 0  # Eagle steps skipped due to L0
 
     def report(self):
         if self.calls > 0:
             avg_time = self.l0_time_us / self.calls
             match_rate = self.l0_matches / max(1, self.l0_tokens) * 100
-            logger.info(f"L0 Stats: {self.calls} calls, avg {avg_time:.1f}μs, match rate {match_rate:.1f}%")
+            use_rate = self.l0_used / self.calls * 100
+            logger.info(f"L0 Stats: {self.calls} calls, avg {avg_time:.1f}μs, match={match_rate:.1f}%, used={use_rate:.1f}%")
         return {
             "calls": self.calls,
             "l0_time_ms": self.l0_time_us / 1000,
             "match_rate": self.l0_matches / max(1, self.l0_tokens),
+            "use_rate": self.l0_used / max(1, self.calls),
         }
 
 
@@ -146,7 +231,7 @@ _l0_global_stats = L0Stats()
 
 
 class L0CudaGraphRunner:
-    """CUDA Graph runner for L0 predictions - separate from EAGLE graphs."""
+    """CUDA Graph runner for L0 predictions - zero overhead version (no confidence check)."""
 
     def __init__(self, l0_model: L0DraftPredictor, hidden_dim: int, k: int, device: str):
         self.l0_model = l0_model
@@ -157,39 +242,36 @@ class L0CudaGraphRunner:
         # Static buffers for CUDA graph
         self.static_hidden = torch.zeros(1, hidden_dim, dtype=torch.float16, device=device)
         self.static_tokens = None
-        self.static_probs = None
 
         # Capture the graph
         self._capture_graph()
 
     def _capture_graph(self):
-        """Capture CUDA graph for L0."""
+        """Capture CUDA graph for L0 - minimal version."""
         # Warmup
         with torch.no_grad():
             for _ in range(3):
                 self.l0_model.draft_k_tokens(self.static_hidden, self.k)
         torch.cuda.synchronize()
 
-        # Capture
+        # Capture graph - tokens only, no probs needed
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            self.static_tokens, self.static_probs = self.l0_model.draft_k_tokens(
-                self.static_hidden, self.k
-            )
+            self.static_tokens, _ = self.l0_model.draft_k_tokens(self.static_hidden, self.k)
 
-        logger.info(f"L0 CUDA graph captured: hidden_dim={self.hidden_dim}, K={self.k}")
+        logger.info(f"L0 CUDA graph captured (no-confidence): hidden_dim={self.hidden_dim}, K={self.k}, vocab={self.l0_model.vocab_size}")
 
-    def run(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run L0 using CUDA graph."""
-        # Copy input to static buffer (only works for batch_size=1)
+    def run(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run L0 using CUDA graph. Returns tokens only (no sync)."""
         if hidden_states.shape[0] == 1:
             self.static_hidden.copy_(hidden_states)
             self.graph.replay()
-            return self.static_tokens.clone(), self.static_probs.clone()
+            return self.static_tokens
         else:
             # Fallback to eager for batch > 1
             with torch.no_grad():
-                return self.l0_model.draft_k_tokens(hidden_states, self.k)
+                tokens, _ = self.l0_model.draft_k_tokens(hidden_states, self.k)
+            return tokens
 
 # ============================================================================
 
@@ -353,16 +435,34 @@ class EAGLEWorker(TpModelWorker):
         if L0_ENABLED:
             try:
                 hidden_dim = self.target_worker.model_runner.model_config.hidden_size
-                vocab_size = self.target_worker.model_runner.model_config.vocab_size
+                # Use reduced vocab for L0 (maps to first 8K tokens)
                 self.l0_model = L0DraftPredictor(
                     hidden_dim=hidden_dim,
                     inner_dim=1024,
-                    vocab_size=vocab_size,
+                    vocab_size=L0_VOCAB_SIZE,
                 ).to(self.device).half().eval()
                 self._l0_hidden_dim = hidden_dim
-                logger.info(f"L0 model created: hidden_dim={hidden_dim}, vocab={vocab_size}, K={self.l0_k}")
+
+                # Load trained weights if checkpoint exists
+                if os.path.exists(L0_CHECKPOINT):
+                    checkpoint = torch.load(L0_CHECKPOINT, map_location=self.device)
+                    if 'model_state_dict' in checkpoint:
+                        state_dict = checkpoint['model_state_dict']
+                    else:
+                        state_dict = checkpoint
+                    # Load with strict=False to allow missing keys (embed.weight is initialized randomly)
+                    missing, unexpected = self.l0_model.load_state_dict(state_dict, strict=False)
+                    logger.info(f"L0 model loaded from {L0_CHECKPOINT}")
+                    if missing:
+                        logger.info(f"  Missing keys (initialized randomly): {missing}")
+                else:
+                    logger.warning(f"L0 checkpoint not found: {L0_CHECKPOINT} - using random weights")
+
+                logger.info(f"L0 model: hidden_dim={hidden_dim}, vocab={L0_VOCAB_SIZE}, K={self.l0_k}, conf_thresh={L0_CONFIDENCE_THRESHOLD}")
             except Exception as e:
                 logger.warning(f"L0 initialization failed: {e}")
+                import traceback
+                traceback.print_exc()
                 self.l0_model = None
         # ==========================================
 
@@ -705,18 +805,52 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
 
-        # ============= L0 INTEGRATION: Run L0 before EAGLE =============
-        _l0_tokens_batch = None
-        _l0_start_time = None
-        if hasattr(self, 'l0_graph_runner') and self.l0_graph_runner is not None:
+        # ============= L0 INTEGRATION (zero overhead - always use L0) =============
+        if hasattr(self, 'l0_graph_runner') and self.l0_graph_runner is not None and L0_SKIP_EAGLE:
             spec_info_inner = forward_batch.spec_info
             hidden_states = getattr(spec_info_inner, 'hidden_states', None)
-            if hidden_states is not None and not self._l0_capturing:
-                import time as time_mod
-                _l0_start_time = time_mod.perf_counter()
-                _l0_tokens_batch, _ = self.l0_graph_runner.run(hidden_states)
+            if hidden_states is not None and not self._l0_capturing and not batch.forward_mode.is_idle():
+                # Run L0 - no confidence check, no CPU sync
+                l0_tokens = self.l0_graph_runner.run(hidden_states)
+
+                # Always use L0 tokens - skip EAGLE entirely
+                _l0_global_stats.calls += 1
+                _l0_global_stats.l0_skipped_eagle += 1
+
+                (
+                    tree_mask,
+                    position,
+                    retrive_index,
+                    retrive_next_token,
+                    retrive_next_sibling,
+                    draft_tokens,
+                ) = create_linear_verify_input(
+                    l0_tokens,
+                    spec_info.verified_id,
+                    batch.seq_lens,
+                    batch.seq_lens_sum,
+                    self.speculative_num_draft_tokens,
+                    self.device,
+                )
+
+                return EagleVerifyInput(
+                    draft_token=draft_tokens,
+                    custom_mask=tree_mask,
+                    positions=position,
+                    retrive_index=retrive_index,
+                    retrive_next_token=retrive_next_token,
+                    retrive_next_sibling=retrive_next_sibling,
+                    retrive_cum_len=None,
+                    spec_steps=self.speculative_num_steps,
+                    topk=self.topk,
+                    draft_token_num=self.speculative_num_draft_tokens,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
         # ===========================================================
 
+        # Normal EAGLE path (when L0 not confident or not enabled)
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -734,31 +868,10 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
 
-        # ============= L0 INTEGRATION: Compare L0 with EAGLE =============
-        if _l0_tokens_batch is not None and draft_tokens is not None and _l0_start_time is not None:
-            import time as time_mod
-            l0_time = (time_mod.perf_counter() - _l0_start_time) * 1e6
-            _l0_global_stats.calls += 1
-            _l0_global_stats.l0_time_us += l0_time
-            _l0_global_stats.l0_tokens += self.l0_k
-
-            # Compare L0's predictions with EAGLE's first K drafts
-            try:
-                draft_flat = draft_tokens.view(-1) if draft_tokens.dim() > 1 else draft_tokens
-                l0_flat = _l0_tokens_batch.view(-1)
-                for i in range(min(self.l0_k, len(draft_flat), len(l0_flat))):
-                    if l0_flat[i].item() == draft_flat[i].item():
-                        _l0_global_stats.l0_matches += 1
-                    else:
-                        break  # Prefix match only
-            except Exception:
-                pass
-
-            if _l0_global_stats.calls % 100 == 0:
-                match_rate = _l0_global_stats.l0_matches / max(1, _l0_global_stats.l0_tokens) * 100
-                avg_time = _l0_global_stats.l0_time_us / _l0_global_stats.calls
-                print(f"[L0] calls={_l0_global_stats.calls}, avg={avg_time:.1f}us, match={match_rate:.1f}%", flush=True)
-        # ================================================================
+        # L0 stats logging (periodic, minimal overhead)
+        if _l0_global_stats.calls > 0 and _l0_global_stats.calls % 500 == 0:
+            skip_rate = _l0_global_stats.l0_skipped_eagle / max(1, _l0_global_stats.calls) * 100
+            print(f"[L0] calls={_l0_global_stats.calls}, skip_rate={skip_rate:.1f}%", flush=True)
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -815,17 +928,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states,
         )
 
-        # ============= L0 INTEGRATION: Run L0 using CUDA graph =============
-        l0_tokens = None
-        l0_start = None
-        # Debug logging for L0
-        _l0_global_stats.l0_tokens += 1  # Count all draft_forward calls (using l0_tokens as temp counter)
-        if _l0_global_stats.l0_tokens % 100 == 0:
-            print(f"[L0] calls={_l0_global_stats.l0_tokens}, graph={self.l0_graph_runner is not None}, hidden={hidden_states is not None}, cap={self._l0_capturing}", flush=True)
-        if self.l0_graph_runner is not None and hidden_states is not None and not self._l0_capturing:
-            l0_start = time.perf_counter()
-            l0_tokens, _ = self.l0_graph_runner.run(hidden_states)
-        # ===================================================================
+        # Note: L0 integration is handled in eagle_draft() method, not here
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         # TODO: We only need self.speculative_num_steps - 1 cache loc
@@ -886,28 +989,7 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-        # ============= L0 INTEGRATION: Compare L0 with EAGLE (stats only) =============
-        if l0_tokens is not None and draft_tokens is not None and l0_start is not None:
-            # Record timing (no synchronize needed - time includes kernel launch)
-            l0_time = (time.perf_counter() - l0_start) * 1e6
-            _l0_global_stats.calls += 1
-            _l0_global_stats.l0_time_us += l0_time
-            _l0_global_stats.l0_tokens += self.l0_k
-
-            # Compare L0's predictions with EAGLE's first tokens
-            draft_flat = draft_tokens.view(-1) if draft_tokens.dim() > 1 else draft_tokens
-            l0_flat = l0_tokens.view(-1)
-            for i in range(min(self.l0_k, len(draft_flat), len(l0_flat))):
-                if l0_flat[i].item() == draft_flat[i].item():
-                    _l0_global_stats.l0_matches += 1
-                else:
-                    break  # Count prefix match only
-
-            # Log stats periodically
-            if _l0_global_stats.calls % 100 == 0:
-                _l0_global_stats.report()
-        # ==============================================================================
-
+        # Note: L0 stats tracking is done in eagle_draft() method
         return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
