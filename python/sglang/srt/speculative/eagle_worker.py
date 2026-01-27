@@ -1,8 +1,11 @@
 import logging
 import time
 from typing import List, Optional, Tuple
+import os
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
@@ -73,6 +76,122 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# L0 INTEGRATION - Ultra-fast draft predictor
+# ============================================================================
+
+# Enable/disable L0 via environment variable
+L0_ENABLED = os.environ.get("L0_ENABLED", "1") == "1"
+L0_K = int(os.environ.get("L0_K", "4"))  # Number of L0 draft tokens
+
+
+class L0DraftPredictor(nn.Module):
+    """
+    L0: Lightweight predictor that drafts K0 tokens before EAGLE.
+
+    Architecture: hidden_state -> fc1 -> ReLU -> fc2 -> logits
+    """
+
+    def __init__(self, hidden_dim: int = 4096, inner_dim: int = 1024, vocab_size: int = 128256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.inner_dim = inner_dim
+        self.vocab_size = vocab_size
+        self.fc1 = nn.Linear(hidden_dim, inner_dim, bias=False)
+        self.fc2 = nn.Linear(inner_dim, vocab_size, bias=False)
+        self.embed = nn.Embedding(vocab_size, inner_dim)
+
+    def draft_k_tokens(self, hidden: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draft K tokens autoregressively from hidden state."""
+        tokens = []
+        probs_list = []
+        inner = F.relu(self.fc1(hidden))  # [batch, inner_dim]
+
+        for i in range(k):
+            logits = self.fc2(inner)  # [batch, vocab]
+            probs = F.softmax(logits, dim=-1)
+            conf, tok = probs.max(dim=-1)  # [batch], [batch]
+            tokens.append(tok)
+            probs_list.append(conf)
+            if i < k - 1:
+                inner = F.relu(inner + self.embed(tok))
+
+        # Return [batch, k], [batch, k]
+        return torch.stack(tokens, dim=1), torch.stack(probs_list, dim=1)
+
+
+# Global stats - updated during inference
+class L0Stats:
+    def __init__(self):
+        self.calls = 0
+        self.l0_time_us = 0
+        self.l0_tokens = 0
+        self.l0_matches = 0
+
+    def report(self):
+        if self.calls > 0:
+            avg_time = self.l0_time_us / self.calls
+            match_rate = self.l0_matches / max(1, self.l0_tokens) * 100
+            logger.info(f"L0 Stats: {self.calls} calls, avg {avg_time:.1f}μs, match rate {match_rate:.1f}%")
+        return {
+            "calls": self.calls,
+            "l0_time_ms": self.l0_time_us / 1000,
+            "match_rate": self.l0_matches / max(1, self.l0_tokens),
+        }
+
+
+_l0_global_stats = L0Stats()
+
+
+class L0CudaGraphRunner:
+    """CUDA Graph runner for L0 predictions - separate from EAGLE graphs."""
+
+    def __init__(self, l0_model: L0DraftPredictor, hidden_dim: int, k: int, device: str):
+        self.l0_model = l0_model
+        self.hidden_dim = hidden_dim
+        self.k = k
+        self.device = device
+
+        # Static buffers for CUDA graph
+        self.static_hidden = torch.zeros(1, hidden_dim, dtype=torch.float16, device=device)
+        self.static_tokens = None
+        self.static_probs = None
+
+        # Capture the graph
+        self._capture_graph()
+
+    def _capture_graph(self):
+        """Capture CUDA graph for L0."""
+        # Warmup
+        with torch.no_grad():
+            for _ in range(3):
+                self.l0_model.draft_k_tokens(self.static_hidden, self.k)
+        torch.cuda.synchronize()
+
+        # Capture
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.static_tokens, self.static_probs = self.l0_model.draft_k_tokens(
+                self.static_hidden, self.k
+            )
+
+        logger.info(f"L0 CUDA graph captured: hidden_dim={self.hidden_dim}, K={self.k}")
+
+    def run(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run L0 using CUDA graph."""
+        # Copy input to static buffer (only works for batch_size=1)
+        if hidden_states.shape[0] == 1:
+            self.static_hidden.copy_(hidden_states)
+            self.graph.replay()
+            return self.static_tokens.clone(), self.static_probs.clone()
+        else:
+            # Fallback to eager for batch > 1
+            with torch.no_grad():
+                return self.l0_model.draft_k_tokens(hidden_states, self.k)
+
+# ============================================================================
 
 
 class EAGLEWorker(TpModelWorker):
@@ -225,6 +344,28 @@ class EAGLEWorker(TpModelWorker):
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
+        # ============= L0 INTEGRATION =============
+        self.l0_model = None
+        self.l0_graph_runner = None
+        self.l0_k = L0_K
+        self._l0_capturing = False  # Flag to disable L0 during EAGLE CUDA graph capture
+
+        if L0_ENABLED:
+            try:
+                hidden_dim = self.target_worker.model_runner.model_config.hidden_size
+                vocab_size = self.target_worker.model_runner.model_config.vocab_size
+                self.l0_model = L0DraftPredictor(
+                    hidden_dim=hidden_dim,
+                    inner_dim=1024,
+                    vocab_size=vocab_size,
+                ).to(self.device).half().eval()
+                self._l0_hidden_dim = hidden_dim
+                logger.info(f"L0 model created: hidden_dim={hidden_dim}, vocab={vocab_size}, K={self.l0_k}")
+            except Exception as e:
+                logger.warning(f"L0 initialization failed: {e}")
+                self.l0_model = None
+        # ==========================================
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
@@ -232,6 +373,9 @@ class EAGLEWorker(TpModelWorker):
 
         if self.server_args.disable_cuda_graph:
             return
+
+        # Disable L0 during CUDA graph capture
+        self._l0_capturing = True
 
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
@@ -266,6 +410,21 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
+
+        # Re-enable L0 and capture L0's CUDA graph
+        self._l0_capturing = False
+        if self.l0_model is not None:
+            try:
+                self.l0_graph_runner = L0CudaGraphRunner(
+                    self.l0_model,
+                    self._l0_hidden_dim,
+                    self.l0_k,
+                    self.device,
+                )
+                logger.info("L0 CUDA graph captured - L0 enabled for inference")
+            except Exception as e:
+                logger.warning(f"L0 CUDA graph capture failed: {e}")
+                self.l0_graph_runner = None
 
     @property
     def draft_model_runner(self):
@@ -545,6 +704,19 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+
+        # ============= L0 INTEGRATION: Run L0 before EAGLE =============
+        _l0_tokens_batch = None
+        _l0_start_time = None
+        if hasattr(self, 'l0_graph_runner') and self.l0_graph_runner is not None:
+            spec_info_inner = forward_batch.spec_info
+            hidden_states = getattr(spec_info_inner, 'hidden_states', None)
+            if hidden_states is not None and not self._l0_capturing:
+                import time as time_mod
+                _l0_start_time = time_mod.perf_counter()
+                _l0_tokens_batch, _ = self.l0_graph_runner.run(hidden_states)
+        # ===========================================================
+
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -561,6 +733,32 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+
+        # ============= L0 INTEGRATION: Compare L0 with EAGLE =============
+        if _l0_tokens_batch is not None and draft_tokens is not None and _l0_start_time is not None:
+            import time as time_mod
+            l0_time = (time_mod.perf_counter() - _l0_start_time) * 1e6
+            _l0_global_stats.calls += 1
+            _l0_global_stats.l0_time_us += l0_time
+            _l0_global_stats.l0_tokens += self.l0_k
+
+            # Compare L0's predictions with EAGLE's first K drafts
+            try:
+                draft_flat = draft_tokens.view(-1) if draft_tokens.dim() > 1 else draft_tokens
+                l0_flat = _l0_tokens_batch.view(-1)
+                for i in range(min(self.l0_k, len(draft_flat), len(l0_flat))):
+                    if l0_flat[i].item() == draft_flat[i].item():
+                        _l0_global_stats.l0_matches += 1
+                    else:
+                        break  # Prefix match only
+            except Exception:
+                pass
+
+            if _l0_global_stats.calls % 100 == 0:
+                match_rate = _l0_global_stats.l0_matches / max(1, _l0_global_stats.l0_tokens) * 100
+                avg_time = _l0_global_stats.l0_time_us / _l0_global_stats.calls
+                print(f"[L0] calls={_l0_global_stats.calls}, avg={avg_time:.1f}us, match={match_rate:.1f}%", flush=True)
+        # ================================================================
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -605,6 +803,8 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
+        global _l0_global_stats
+
         # Parse args
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -614,6 +814,18 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+
+        # ============= L0 INTEGRATION: Run L0 using CUDA graph =============
+        l0_tokens = None
+        l0_start = None
+        # Debug logging for L0
+        _l0_global_stats.l0_tokens += 1  # Count all draft_forward calls (using l0_tokens as temp counter)
+        if _l0_global_stats.l0_tokens % 100 == 0:
+            print(f"[L0] calls={_l0_global_stats.l0_tokens}, graph={self.l0_graph_runner is not None}, hidden={hidden_states is not None}, cap={self._l0_capturing}", flush=True)
+        if self.l0_graph_runner is not None and hidden_states is not None and not self._l0_capturing:
+            l0_start = time.perf_counter()
+            l0_tokens, _ = self.l0_graph_runner.run(hidden_states)
+        # ===================================================================
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         # TODO: We only need self.speculative_num_steps - 1 cache loc
@@ -673,6 +885,28 @@ class EAGLEWorker(TpModelWorker):
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
+
+        # ============= L0 INTEGRATION: Compare L0 with EAGLE (stats only) =============
+        if l0_tokens is not None and draft_tokens is not None and l0_start is not None:
+            # Record timing (no synchronize needed - time includes kernel launch)
+            l0_time = (time.perf_counter() - l0_start) * 1e6
+            _l0_global_stats.calls += 1
+            _l0_global_stats.l0_time_us += l0_time
+            _l0_global_stats.l0_tokens += self.l0_k
+
+            # Compare L0's predictions with EAGLE's first tokens
+            draft_flat = draft_tokens.view(-1) if draft_tokens.dim() > 1 else draft_tokens
+            l0_flat = l0_tokens.view(-1)
+            for i in range(min(self.l0_k, len(draft_flat), len(l0_flat))):
+                if l0_flat[i].item() == draft_flat[i].item():
+                    _l0_global_stats.l0_matches += 1
+                else:
+                    break  # Count prefix match only
+
+            # Log stats periodically
+            if _l0_global_stats.calls % 100 == 0:
+                _l0_global_stats.report()
+        # ==============================================================================
 
         return parent_list, top_scores_index, draft_tokens
 
