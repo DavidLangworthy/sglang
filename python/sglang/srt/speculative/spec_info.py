@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    BABY_EAGLE = auto()  # Tiny draft model that fits in L2 cache
     NONE = auto()
 
     @classmethod
@@ -46,8 +47,11 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_baby_eagle(self) -> bool:
+        return self == SpeculativeAlgorithm.BABY_EAGLE
+
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_baby_eagle()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -101,6 +105,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+
+        elif self.is_baby_eagle():
+            from sglang.srt.speculative.baby_eagle_worker import BabyEagleWorker
+
+            return BabyEagleWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
