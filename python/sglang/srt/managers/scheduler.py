@@ -2980,6 +2980,11 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Log Baby EAGLE env vars for debugging (these should be inherited from parent)
+    baby_eagle_enabled = os.environ.get("BABY_EAGLE_ENABLED", "0")
+    if baby_eagle_enabled == "1":
+        logger.info(f"[Scheduler] Baby EAGLE enabled, checkpoint: {os.environ.get('BABY_EAGLE_CHECKPOINT', 'default')}")
+
     # Generate the logger prefix
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:

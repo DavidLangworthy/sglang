@@ -788,6 +788,13 @@ def _set_envs_and_config(server_args: ServerArgs):
         f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
     )
 
+    # Propagate Baby EAGLE env vars to subprocess workers
+    # These need to be set here since mp.spawn doesn't inherit parent env
+    for env_var in ["BABY_EAGLE_ENABLED", "BABY_EAGLE_CHECKPOINT", "BABY_EAGLE_VOCAB_SIZE", "L0_ENABLED"]:
+        if env_var in os.environ:
+            # Already set, keep it (ensures subprocess workers see it)
+            pass  # os.environ already has it
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
