@@ -97,6 +97,10 @@ BABY_EAGLE_ENABLED = os.environ.get("BABY_EAGLE_ENABLED", "0") == "1"
 BABY_EAGLE_CHECKPOINT = os.environ.get("BABY_EAGLE_CHECKPOINT", "/workspace/lager/projects/baby_eagle/checkpoints_v2/best.pt")
 BABY_EAGLE_VOCAB_SIZE = int(os.environ.get("BABY_EAGLE_VOCAB_SIZE", "8000"))
 
+# Debug logging at module load time
+logger.info(f"[Baby EAGLE] BABY_EAGLE_ENABLED={BABY_EAGLE_ENABLED} (env: {os.environ.get('BABY_EAGLE_ENABLED', 'not set')})")
+logger.info(f"[Baby EAGLE] BABY_EAGLE_CHECKPOINT={BABY_EAGLE_CHECKPOINT} (exists: {os.path.exists(BABY_EAGLE_CHECKPOINT)})")
+
 
 def create_linear_verify_input(
     l0_tokens: torch.Tensor,
