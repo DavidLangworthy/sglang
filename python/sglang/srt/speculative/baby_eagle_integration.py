@@ -2,8 +2,7 @@
 Baby EAGLE Integration for SGLang.
 
 This module provides proper BabyEagle integration with KV cross-attention.
-Unlike TinyEagleModel which only uses hidden states, this uses the real
-BabyEagle architecture with cross-attention to target model's KV cache.
+It loads the trained BabyEagle model directly from the original model.py.
 
 Key architecture:
 - Uses KV from ONE target layer (layer 16), replicated for all BabyEagle layers
@@ -22,221 +21,27 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+# Add Baby EAGLE project path for model imports
+_BABY_EAGLE_PATH = "/workspace/lager/projects/baby_eagle"
+if _BABY_EAGLE_PATH not in sys.path:
+    sys.path.insert(0, _BABY_EAGLE_PATH)
+
 # Configuration via environment variables
 BABY_EAGLE_KV_LAYER = int(os.environ.get("BABY_EAGLE_KV_LAYER", "16"))
 BABY_EAGLE_KV_MAX_LEN = int(os.environ.get("BABY_EAGLE_KV_MAX_LEN", "2048"))
 
 
-class RealBabyEagleModel(nn.Module):
+class BabyEagleKVCudaGraphRunner:
     """
-    Real Baby EAGLE model with KV cross-attention.
+    CUDA Graph runner for Baby EAGLE with KV cross-attention.
 
-    This is the proper architecture that was trained and achieves 38% acceptance.
-    Unlike TinyEagleModel, this uses cross-attention to target model's KV cache.
-    """
-
-    def __init__(
-        self,
-        target_hidden_size: int = 4096,
-        target_num_kv_heads: int = 8,
-        target_head_dim: int = 128,
-        internal_dim: int = 512,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        cross_attn_layers: int = 2,
-        draft_vocab_size: int = 8192,
-    ):
-        super().__init__()
-        self.target_hidden_size = target_hidden_size
-        self.target_num_kv_heads = target_num_kv_heads
-        self.target_head_dim = target_head_dim
-        self.internal_dim = internal_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.cross_attn_layers = cross_attn_layers
-        self.draft_vocab_size = draft_vocab_size
-        self.head_dim = internal_dim // num_heads
-
-        # Input projection from target hidden size
-        self.input_proj = nn.Linear(target_hidden_size, internal_dim, bias=False)
-
-        # Token embeddings for draft tokens
-        self.embed_tokens = nn.Embedding(draft_vocab_size, internal_dim)
-
-        # KV projection with bottleneck
-        kv_bottleneck = 256
-        target_kv_dim = target_num_kv_heads * target_head_dim
-        self.k_down = nn.Linear(target_kv_dim, kv_bottleneck)
-        self.k_up = nn.Linear(kv_bottleneck, internal_dim)
-        self.v_down = nn.Linear(target_kv_dim, kv_bottleneck)
-        self.v_up = nn.Linear(kv_bottleneck, internal_dim)
-
-        # Transformer layers
-        self.layers = nn.ModuleList([
-            BabyEagleLayer(
-                internal_dim,
-                num_heads,
-                has_cross_attn=(i < cross_attn_layers)
-            )
-            for i in range(num_layers)
-        ])
-
-        # Output
-        self.norm = nn.LayerNorm(internal_dim)
-        self.output_down = nn.Linear(internal_dim, 128)
-        self.lm_head = nn.Linear(128, draft_vocab_size, bias=False)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        target_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        draft_token_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass with KV cross-attention.
-
-        Args:
-            hidden_states: [batch, hidden_dim] from target model
-            target_kv: (K, V) tuple from target layer 16
-                      K/V shape: [batch, num_kv_heads, seq_len, head_dim]
-            draft_token_ids: [batch, seq] previous draft tokens
-
-        Returns:
-            logits: [batch, 1+seq, vocab_size]
-        """
-        batch_size = hidden_states.shape[0]
-
-        # Project target hidden state
-        if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(1)  # [batch, 1, hidden]
-        x = self.input_proj(hidden_states)  # [batch, 1, internal_dim]
-
-        # Add draft token embeddings if provided
-        if draft_token_ids is not None and draft_token_ids.numel() > 0:
-            tok_emb = self.embed_tokens(draft_token_ids)  # [batch, seq, internal_dim]
-            x = torch.cat([x, tok_emb], dim=1)  # [batch, 1+seq, internal_dim]
-
-        # Process target KV for cross-attention
-        projected_k, projected_v = None, None
-        if target_kv is not None:
-            target_k, target_v = target_kv
-            # target_k: [batch, num_kv_heads, seq_len, head_dim]
-            # Reshape to [batch, seq_len, num_kv_heads * head_dim]
-            kv_len = target_k.shape[2]
-            target_k_flat = target_k.transpose(1, 2).reshape(batch_size, kv_len, -1)
-            target_v_flat = target_v.transpose(1, 2).reshape(batch_size, kv_len, -1)
-
-            # Project through bottleneck
-            projected_k = self.k_up(F.gelu(self.k_down(target_k_flat)))
-            projected_v = self.v_up(F.gelu(self.v_down(target_v_flat)))
-
-        # Pass through layers
-        for layer in self.layers:
-            x = layer(x, projected_k, projected_v)
-
-        # Output projection
-        x = self.norm(x)
-        x = self.output_down(x)
-        return self.lm_head(x)
-
-
-class BabyEagleLayer(nn.Module):
-    """Single transformer layer with optional cross-attention."""
-
-    def __init__(self, dim: int, num_heads: int, has_cross_attn: bool = True):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.has_cross_attn = has_cross_attn
-
-        # Cross-attention (to target KV)
-        if has_cross_attn:
-            self.cross_q_proj = nn.Linear(dim, dim, bias=False)
-            self.cross_o_proj = nn.Linear(dim, dim, bias=False)
-            self.cross_norm = nn.LayerNorm(dim)
-
-        # Self-attention
-        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
-        self.self_norm = nn.LayerNorm(dim)
-
-        # MLP
-        self.gate_proj = nn.Linear(dim, dim * 4, bias=False)
-        self.up_proj = nn.Linear(dim, dim * 4, bias=False)
-        self.down_proj = nn.Linear(dim * 4, dim, bias=False)
-        self.mlp_norm = nn.LayerNorm(dim)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv_k: Optional[torch.Tensor] = None,
-        kv_v: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-
-        # Cross-attention to target KV
-        if self.has_cross_attn and kv_k is not None:
-            residual = x
-            x = self.cross_norm(x)
-
-            # Query from current state
-            q = self.cross_q_proj(x)
-            q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-            # K, V already projected to internal_dim
-            kv_len = kv_k.shape[1]
-            k = kv_k.view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
-            v = kv_v.view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-            # Attention
-            scale = self.head_dim ** -0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            attn = F.softmax(attn, dim=-1)
-            out = torch.matmul(attn, v)
-            out = out.transpose(1, 2).reshape(batch_size, seq_len, self.dim)
-            x = residual + self.cross_o_proj(out)
-
-        # Self-attention
-        residual = x
-        x = self.self_norm(x)
-
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, heads, seq, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        # Causal mask
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
-        attn = attn.masked_fill(mask, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).reshape(batch_size, seq_len, self.dim)
-        x = residual + self.o_proj(out)
-
-        # MLP
-        residual = x
-        x = self.mlp_norm(x)
-        x = residual + self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-        return x
-
-
-class RealBabyEagleCudaGraphRunner:
-    """
-    CUDA Graph runner for Real Baby EAGLE with KV cross-attention.
-
-    Key difference from TinyEagleModel runner:
-    - Includes static KV buffer for cross-attention
-    - Properly handles KV from target model
+    Uses the original trained BabyEagle model and captures CUDA graphs
+    for efficient inference.
     """
 
     def __init__(
         self,
-        model: RealBabyEagleModel,
+        model: nn.Module,  # Original BabyEagle model
         hidden_dim: int,
         k: int,
         max_kv_len: int,
@@ -248,9 +53,11 @@ class RealBabyEagleCudaGraphRunner:
         self.max_kv_len = max_kv_len
         self.device = device
 
-        # Model dimensions
-        self.num_kv_heads = model.target_num_kv_heads
-        self.head_dim = model.target_head_dim
+        # Model dimensions from config
+        config = model.config
+        self.num_kv_heads = config.target_num_kv_heads
+        self.head_dim = config.target_head_dim
+        self.draft_vocab_size = config.output_vocab_size
 
         # Static buffers
         self.static_hidden = torch.zeros(1, hidden_dim, dtype=torch.float16, device=device)
@@ -267,30 +74,47 @@ class RealBabyEagleCudaGraphRunner:
         self._capture_graph()
 
     def _capture_graph(self):
-        """Capture CUDA graph for draft generation with KV cross-attention."""
-        # Warmup
-        for _ in range(3):
+        """Capture CUDA graph for draft generation with KV cross-attention.
+
+        Note: We capture k separate graphs, one for each draft step, to avoid
+        the dynamic tensor concatenation issue in CUDA graphs.
+        """
+        # Create KV list format expected by model (single layer repeated)
+        kv_list = [(self.static_k, self.static_v)]
+
+        # Static buffer for draft tokens (used as input for autoregressive steps)
+        self.static_draft_input = torch.zeros(1, self.k, dtype=torch.long, device=self.device)
+
+        # Warmup all configurations
+        for step in range(self.k):
             with torch.no_grad():
-                logits = self.model(self.static_hidden, (self.static_k, self.static_v))
+                if step == 0:
+                    logits = self.model(self.static_hidden, kv_list, None)
+                else:
+                    draft_slice = self.static_draft_input[:, :step]
+                    logits = self.model(self.static_hidden, kv_list, draft_slice)
         torch.cuda.synchronize()
 
-        # Capture graph - generate k tokens
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            draft_input = None
-            for i in range(self.k):
-                logits = self.model(self.static_hidden, (self.static_k, self.static_v), draft_input)
-                next_token = logits[:, -1, :].argmax(dim=-1)
-                next_token = torch.clamp(next_token, 0, self.model.draft_vocab_size - 1)
-                self.static_output_tokens[:, i] = next_token
+        # Capture separate graphs for each step
+        self.graphs = []
+        self.static_logits = []
 
-                if draft_input is None:
-                    draft_input = next_token.unsqueeze(1)
+        for step in range(self.k):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                if step == 0:
+                    logits = self.model(self.static_hidden, kv_list, None)
                 else:
-                    draft_input = torch.cat([draft_input, next_token.unsqueeze(1)], dim=1)
+                    draft_slice = self.static_draft_input[:, :step]
+                    logits = self.model(self.static_hidden, kv_list, draft_slice)
+
+                # Store the logits tensor for later access
+                self.static_logits.append(logits)
+
+            self.graphs.append(graph)
 
         num_params = sum(p.numel() for p in self.model.parameters())
-        logger.info(f"Real Baby EAGLE CUDA graph captured: {num_params:,} params, K={self.k}, max_kv_len={self.max_kv_len}")
+        logger.info(f"Baby EAGLE CUDA graph captured: {num_params:,} params, K={self.k}, max_kv_len={self.max_kv_len}")
 
     def run(
         self,
@@ -299,7 +123,7 @@ class RealBabyEagleCudaGraphRunner:
         target_v: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Run CUDA graph to generate draft tokens with KV cross-attention.
+        Run CUDA graphs to generate draft tokens with KV cross-attention.
 
         Args:
             hidden_states: [batch, hidden_dim]
@@ -326,8 +150,23 @@ class RealBabyEagleCudaGraphRunner:
 
         self.actual_kv_len = min(kv_len, self.max_kv_len)
 
-        # Replay graph
-        self.graph.replay()
+        # Clear draft input buffer
+        self.static_draft_input.zero_()
+
+        # Generate k tokens using separate graphs
+        for step in range(self.k):
+            # Replay the graph for this step
+            self.graphs[step].replay()
+
+            # Get the token from logits
+            logits = self.static_logits[step]
+            next_token = logits[:, -1, :].argmax(dim=-1)
+            next_token = torch.clamp(next_token, 0, self.draft_vocab_size - 1)
+
+            # Store in output and input buffers
+            self.static_output_tokens[:, step] = next_token
+            if step < self.k - 1:
+                self.static_draft_input[:, step] = next_token
 
         return self.static_output_tokens.clone()
 
@@ -402,46 +241,53 @@ def load_baby_eagle_checkpoint(
     checkpoint_path: str,
     device: str,
     dtype: torch.dtype = torch.float16,
-) -> RealBabyEagleModel:
-    """Load Baby EAGLE model from checkpoint."""
-    # Try to import the original BabyEagle for config
-    try:
-        sys.path.insert(0, "/workspace/lager/projects/baby_eagle")
-        from model import BabyEagleConfig
-        from train import TrainConfig  # Needed for unpickling
-    except ImportError:
-        logger.warning("Could not import BabyEagle config, using defaults")
+) -> nn.Module:
+    """Load Baby EAGLE model from checkpoint.
 
+    Uses the original BabyEagle model class from model.py to ensure
+    architecture compatibility with trained weights.
+    """
+    # Import original model
+    try:
+        from model import BabyEagle, BabyEagleConfig
+        logger.info("Successfully imported BabyEagle from model.py")
+    except ImportError as e:
+        logger.error(f"Failed to import BabyEagle model: {e}")
+        raise
+
+    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Get config from checkpoint or use defaults
+    # Get config from checkpoint
     if "model_config" in checkpoint:
-        cfg = checkpoint["model_config"]
-        model = RealBabyEagleModel(
-            target_hidden_size=getattr(cfg, "target_hidden_dim", 4096),
-            target_num_kv_heads=getattr(cfg, "target_num_kv_heads", 8),
-            target_head_dim=getattr(cfg, "target_head_dim", 128),
-            internal_dim=getattr(cfg, "internal_dim", 512),
-            num_layers=getattr(cfg, "num_layers", 4),
-            num_heads=getattr(cfg, "num_heads", 8),
-            cross_attn_layers=getattr(cfg, "cross_attn_layers", 2),
-            draft_vocab_size=getattr(cfg, "output_vocab_size", 8192),
-        )
+        cfg_data = checkpoint["model_config"]
+        # Handle both dict and dataclass formats
+        if isinstance(cfg_data, dict):
+            config = BabyEagleConfig(**cfg_data)
+        else:
+            config = cfg_data
+        logger.info(f"Baby EAGLE config: internal_dim={config.internal_dim}, "
+                   f"layers={config.num_layers}, heads={config.num_heads}, "
+                   f"vocab={config.output_vocab_size}")
     else:
-        model = RealBabyEagleModel()
+        logger.info("No model_config in checkpoint, using defaults")
+        config = BabyEagleConfig()
 
-    # Load state dict (with compatibility handling)
+    # Create model with config
+    model = BabyEagle(config)
+
+    # Load state dict
     state_dict = checkpoint["model_state_dict"]
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
     if missing:
-        logger.info(f"Missing keys (will use random init): {missing[:5]}...")
+        logger.warning(f"Missing keys: {missing[:5]}...")
     if unexpected:
-        logger.info(f"Unexpected keys (ignored): {unexpected[:5]}...")
+        logger.warning(f"Unexpected keys: {unexpected[:5]}...")
 
     model = model.to(device).to(dtype).eval()
 
     num_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Loaded Real Baby EAGLE: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB)")
+    logger.info(f"Loaded Baby EAGLE: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB)")
 
     return model

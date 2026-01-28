@@ -94,7 +94,7 @@ L0_SKIP_EAGLE = os.environ.get("L0_SKIP_EAGLE", "1") == "1"  # Skip EAGLE entire
 # BABY EAGLE INTEGRATION - Tiny draft model that fits in L2 cache
 # ============================================================================
 BABY_EAGLE_ENABLED = os.environ.get("BABY_EAGLE_ENABLED", "0") == "1"
-BABY_EAGLE_CHECKPOINT = os.environ.get("BABY_EAGLE_CHECKPOINT", "/workspace/lager/projects/baby_eagle/checkpoints_v2/best.pt")
+BABY_EAGLE_CHECKPOINT = os.environ.get("BABY_EAGLE_CHECKPOINT", "/workspace/lager/projects/baby_eagle/checkpoints_v2/best_clean.pt")
 BABY_EAGLE_VOCAB_SIZE = int(os.environ.get("BABY_EAGLE_VOCAB_SIZE", "8000"))
 
 # Debug logging at module load time
@@ -291,8 +291,7 @@ class L0CudaGraphRunner:
 # Import real Baby EAGLE integration
 try:
     from sglang.srt.speculative.baby_eagle_integration import (
-        RealBabyEagleModel,
-        RealBabyEagleCudaGraphRunner,
+        BabyEagleKVCudaGraphRunner,
         extract_kv_from_pool,
         load_baby_eagle_checkpoint,
         BABY_EAGLE_KV_LAYER,
@@ -659,7 +658,8 @@ class EAGLEWorker(TpModelWorker):
         # ============= BABY EAGLE INTEGRATION (with KV cross-attention) =============
         self.baby_eagle_model = None
         self.baby_eagle_graph_runner = None
-        self.baby_eagle_k = L0_K  # Use same K as L0 for now
+        # Baby EAGLE generates (num_draft_tokens - 1) tokens since verified_id is prepended
+        self.baby_eagle_k = self.speculative_num_draft_tokens - 1
         self._baby_eagle_capturing = False
         self._baby_eagle_use_kv = False  # Flag for KV cross-attention mode
 
@@ -777,14 +777,14 @@ class EAGLEWorker(TpModelWorker):
             try:
                 if self._baby_eagle_use_kv and BABY_EAGLE_INTEGRATION_AVAILABLE:
                     # Use real Baby EAGLE with KV cross-attention
-                    self.baby_eagle_graph_runner = RealBabyEagleCudaGraphRunner(
+                    self.baby_eagle_graph_runner = BabyEagleKVCudaGraphRunner(
                         self.baby_eagle_model,
                         self._baby_eagle_hidden_dim,
                         self.baby_eagle_k,
                         max_kv_len=BABY_EAGLE_KV_MAX_LEN,
                         device=self.device,
                     )
-                    logger.info(f"Real Baby EAGLE CUDA graph captured - using KV cross-attention (layer {BABY_EAGLE_KV_LAYER}, max_kv_len={BABY_EAGLE_KV_MAX_LEN})")
+                    logger.info(f"Baby EAGLE CUDA graph captured - using KV cross-attention (layer {BABY_EAGLE_KV_LAYER}, max_kv_len={BABY_EAGLE_KV_MAX_LEN})")
                 else:
                     # Fallback without KV
                     self.baby_eagle_graph_runner = BabyEagleCudaGraphRunner(
