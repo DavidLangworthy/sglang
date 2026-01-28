@@ -281,11 +281,27 @@ class L0CudaGraphRunner:
             return tokens
 
 # ============================================================================
-# BABY EAGLE - Tiny draft model (~19M params, fits in L2 cache)
+# BABY EAGLE - Real model with KV cross-attention (~21M params, fits in L2 cache)
 # ============================================================================
 
+# Import real Baby EAGLE integration
+try:
+    from sglang.srt.speculative.baby_eagle_integration import (
+        RealBabyEagleModel,
+        RealBabyEagleCudaGraphRunner,
+        extract_kv_from_pool,
+        load_baby_eagle_checkpoint,
+        BABY_EAGLE_KV_LAYER,
+        BABY_EAGLE_KV_MAX_LEN,
+    )
+    BABY_EAGLE_INTEGRATION_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Baby EAGLE integration not available: {e}")
+    BABY_EAGLE_INTEGRATION_AVAILABLE = False
+
+
 class TinyTransformerLayer(nn.Module):
-    """Minimal transformer layer for Baby EAGLE."""
+    """Minimal transformer layer for Baby EAGLE (fallback without KV)."""
 
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
@@ -330,7 +346,7 @@ class TinyTransformerLayer(nn.Module):
 
 
 class TinyEagleModel(nn.Module):
-    """Tiny EAGLE model optimized for L2 cache residency (~19M params, 35.6 MB)."""
+    """Tiny EAGLE model - fallback without KV cross-attention."""
 
     def __init__(self, target_hidden_size: int = 4096, internal_dim: int = 512,
                  num_layers: int = 2, num_heads: int = 8, draft_vocab_size: int = 8000):
@@ -361,7 +377,7 @@ class TinyEagleModel(nn.Module):
 
 
 class BabyEagleCudaGraphRunner:
-    """CUDA Graph runner for Baby EAGLE - generates k draft tokens."""
+    """CUDA Graph runner for Baby EAGLE - fallback without KV cross-attention."""
 
     def __init__(self, model: TinyEagleModel, hidden_dim: int, k: int, device: str):
         self.model = model
@@ -410,7 +426,7 @@ class BabyEagleCudaGraphRunner:
 
         torch.cuda.synchronize()
         num_params = sum(p.numel() for p in self.model.parameters())
-        logger.info(f"Baby EAGLE CUDA graphs captured: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB), K={self.k}")
+        logger.info(f"Baby EAGLE CUDA graphs captured (no KV): {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB), K={self.k}")
 
     def run(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Generate k draft tokens using CUDA graphs."""
@@ -636,40 +652,54 @@ class EAGLEWorker(TpModelWorker):
                 self.l0_model = None
         # ==========================================
 
-        # ============= BABY EAGLE INTEGRATION =============
+        # ============= BABY EAGLE INTEGRATION (with KV cross-attention) =============
         self.baby_eagle_model = None
         self.baby_eagle_graph_runner = None
         self.baby_eagle_k = L0_K  # Use same K as L0 for now
         self._baby_eagle_capturing = False
+        self._baby_eagle_use_kv = False  # Flag for KV cross-attention mode
 
         if BABY_EAGLE_ENABLED:
             try:
                 hidden_dim = self.target_worker.model_runner.model_config.hidden_size
-                self.baby_eagle_model = TinyEagleModel(
-                    target_hidden_size=hidden_dim,
-                    internal_dim=512,
-                    num_layers=2,
-                    num_heads=8,
-                    draft_vocab_size=BABY_EAGLE_VOCAB_SIZE,
-                ).to(self.device).half().eval()
-                self._baby_eagle_hidden_dim = hidden_dim
 
-                # Load trained weights if checkpoint exists
-                if os.path.exists(BABY_EAGLE_CHECKPOINT):
-                    checkpoint = torch.load(BABY_EAGLE_CHECKPOINT, map_location=self.device, weights_only=False)
-                    if 'model_state_dict' in checkpoint:
-                        state_dict = checkpoint['model_state_dict']
-                    else:
-                        state_dict = checkpoint
-                    missing, unexpected = self.baby_eagle_model.load_state_dict(state_dict, strict=False)
-                    logger.info(f"Baby EAGLE model loaded from {BABY_EAGLE_CHECKPOINT}")
-                    if missing:
-                        logger.info(f"  Missing keys (initialized randomly): {missing}")
+                # Try to use real Baby EAGLE with KV cross-attention
+                if BABY_EAGLE_INTEGRATION_AVAILABLE and os.path.exists(BABY_EAGLE_CHECKPOINT):
+                    logger.info(f"Loading Real Baby EAGLE with KV cross-attention from {BABY_EAGLE_CHECKPOINT}")
+                    self.baby_eagle_model = load_baby_eagle_checkpoint(
+                        BABY_EAGLE_CHECKPOINT,
+                        self.device,
+                        dtype=torch.float16,
+                    )
+                    self._baby_eagle_use_kv = True
+                    self._baby_eagle_hidden_dim = hidden_dim
+                    logger.info(f"Real Baby EAGLE loaded - using KV cross-attention from layer {BABY_EAGLE_KV_LAYER}")
                 else:
-                    logger.warning(f"Baby EAGLE checkpoint not found: {BABY_EAGLE_CHECKPOINT} - using random weights")
+                    # Fallback to TinyEagleModel without KV
+                    logger.warning("Falling back to TinyEagleModel without KV cross-attention")
+                    self.baby_eagle_model = TinyEagleModel(
+                        target_hidden_size=hidden_dim,
+                        internal_dim=512,
+                        num_layers=2,
+                        num_heads=8,
+                        draft_vocab_size=BABY_EAGLE_VOCAB_SIZE,
+                    ).to(self.device).half().eval()
+                    self._baby_eagle_hidden_dim = hidden_dim
+
+                    # Load trained weights if checkpoint exists
+                    if os.path.exists(BABY_EAGLE_CHECKPOINT):
+                        checkpoint = torch.load(BABY_EAGLE_CHECKPOINT, map_location=self.device, weights_only=False)
+                        if 'model_state_dict' in checkpoint:
+                            state_dict = checkpoint['model_state_dict']
+                        else:
+                            state_dict = checkpoint
+                        missing, unexpected = self.baby_eagle_model.load_state_dict(state_dict, strict=False)
+                        logger.info(f"TinyEagleModel loaded from {BABY_EAGLE_CHECKPOINT}")
+                        if missing:
+                            logger.info(f"  Missing keys (initialized randomly): {len(missing)} keys")
 
                 num_params = sum(p.numel() for p in self.baby_eagle_model.parameters())
-                logger.info(f"Baby EAGLE model: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB), hidden_dim={hidden_dim}, vocab={BABY_EAGLE_VOCAB_SIZE}, K={self.baby_eagle_k}")
+                logger.info(f"Baby EAGLE model: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB), hidden_dim={hidden_dim}, vocab={BABY_EAGLE_VOCAB_SIZE}, K={self.baby_eagle_k}, use_kv={self._baby_eagle_use_kv}")
             except Exception as e:
                 logger.warning(f"Baby EAGLE initialization failed: {e}")
                 import traceback
@@ -741,15 +771,29 @@ class EAGLEWorker(TpModelWorker):
         self._baby_eagle_capturing = False
         if self.baby_eagle_model is not None:
             try:
-                self.baby_eagle_graph_runner = BabyEagleCudaGraphRunner(
-                    self.baby_eagle_model,
-                    self._baby_eagle_hidden_dim,
-                    self.baby_eagle_k,
-                    self.device,
-                )
-                logger.info("Baby EAGLE CUDA graph captured - Baby EAGLE enabled for inference")
+                if self._baby_eagle_use_kv and BABY_EAGLE_INTEGRATION_AVAILABLE:
+                    # Use real Baby EAGLE with KV cross-attention
+                    self.baby_eagle_graph_runner = RealBabyEagleCudaGraphRunner(
+                        self.baby_eagle_model,
+                        self._baby_eagle_hidden_dim,
+                        self.baby_eagle_k,
+                        max_kv_len=BABY_EAGLE_KV_MAX_LEN,
+                        device=self.device,
+                    )
+                    logger.info(f"Real Baby EAGLE CUDA graph captured - using KV cross-attention (layer {BABY_EAGLE_KV_LAYER}, max_kv_len={BABY_EAGLE_KV_MAX_LEN})")
+                else:
+                    # Fallback without KV
+                    self.baby_eagle_graph_runner = BabyEagleCudaGraphRunner(
+                        self.baby_eagle_model,
+                        self._baby_eagle_hidden_dim,
+                        self.baby_eagle_k,
+                        self.device,
+                    )
+                    logger.info("Baby EAGLE CUDA graph captured (no KV) - Baby EAGLE enabled for inference")
             except Exception as e:
                 logger.warning(f"Baby EAGLE CUDA graph capture failed: {e}")
+                import traceback
+                traceback.print_exc()
                 self.baby_eagle_graph_runner = None
 
     @property
@@ -1031,48 +1075,70 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
 
-        # ============= BABY EAGLE INTEGRATION (zero overhead - always use Baby EAGLE) =============
+        # ============= BABY EAGLE INTEGRATION (with KV cross-attention) =============
         if hasattr(self, 'baby_eagle_graph_runner') and self.baby_eagle_graph_runner is not None and BABY_EAGLE_ENABLED:
             spec_info_inner = forward_batch.spec_info
             hidden_states = getattr(spec_info_inner, 'hidden_states', None)
             if hidden_states is not None and not self._baby_eagle_capturing and not batch.forward_mode.is_idle():
-                # Run Baby EAGLE - CUDA graph accelerated
-                baby_eagle_tokens = self.baby_eagle_graph_runner.run(hidden_states)
+                try:
+                    if self._baby_eagle_use_kv and BABY_EAGLE_INTEGRATION_AVAILABLE:
+                        # Real Baby EAGLE with KV cross-attention
+                        # Extract KV from target model's layer 16
+                        target_k, target_v = extract_kv_from_pool(
+                            self.target_worker.model_runner.token_to_kv_pool,
+                            batch.req_to_token_pool.req_to_token,
+                            batch.req_pool_indices,
+                            batch.seq_lens,
+                            layer_idx=BABY_EAGLE_KV_LAYER,
+                            max_kv_len=BABY_EAGLE_KV_MAX_LEN,
+                        )
 
-                # Clamp to draft vocab
-                baby_eagle_tokens = torch.clamp(baby_eagle_tokens, 0, BABY_EAGLE_VOCAB_SIZE - 1)
+                        # Run Baby EAGLE with KV cross-attention
+                        baby_eagle_tokens = self.baby_eagle_graph_runner.run(
+                            hidden_states, target_k, target_v
+                        )
+                    else:
+                        # Fallback: Baby EAGLE without KV (hidden states only)
+                        baby_eagle_tokens = self.baby_eagle_graph_runner.run(hidden_states)
 
-                (
-                    tree_mask,
-                    position,
-                    retrive_index,
-                    retrive_next_token,
-                    retrive_next_sibling,
-                    draft_tokens,
-                ) = create_linear_verify_input(
-                    baby_eagle_tokens,
-                    spec_info.verified_id,
-                    batch.seq_lens,
-                    batch.seq_lens_sum,
-                    self.speculative_num_draft_tokens,
-                    self.device,
-                )
+                    # Clamp to draft vocab
+                    baby_eagle_tokens = torch.clamp(baby_eagle_tokens, 0, BABY_EAGLE_VOCAB_SIZE - 1)
 
-                return EagleVerifyInput(
-                    draft_token=draft_tokens,
-                    custom_mask=tree_mask,
-                    positions=position,
-                    retrive_index=retrive_index,
-                    retrive_next_token=retrive_next_token,
-                    retrive_next_sibling=retrive_next_sibling,
-                    retrive_cum_len=None,
-                    spec_steps=self.speculative_num_steps,
-                    topk=self.topk,
-                    draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    seq_lens_sum=forward_batch.seq_lens_sum,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
-                )
+                    (
+                        tree_mask,
+                        position,
+                        retrive_index,
+                        retrive_next_token,
+                        retrive_next_sibling,
+                        draft_tokens,
+                    ) = create_linear_verify_input(
+                        baby_eagle_tokens,
+                        spec_info.verified_id,
+                        batch.seq_lens,
+                        batch.seq_lens_sum,
+                        self.speculative_num_draft_tokens,
+                        self.device,
+                    )
+
+                    return EagleVerifyInput(
+                        draft_token=draft_tokens,
+                        custom_mask=tree_mask,
+                        positions=position,
+                        retrive_index=retrive_index,
+                        retrive_next_token=retrive_next_token,
+                        retrive_next_sibling=retrive_next_sibling,
+                        retrive_cum_len=None,
+                        spec_steps=self.speculative_num_steps,
+                        topk=self.topk,
+                        draft_token_num=self.speculative_num_draft_tokens,
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        seq_lens_sum=forward_batch.seq_lens_sum,
+                        seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    )
+                except Exception as e:
+                    logger.warning(f"Baby EAGLE draft failed, falling back to EAGLE: {e}")
+                    import traceback
+                    traceback.print_exc()
         # ===========================================================
 
         # ============= L0 INTEGRATION (zero overhead - always use L0) =============
