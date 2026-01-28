@@ -90,6 +90,13 @@ L0_VOCAB_SIZE = int(os.environ.get("L0_VOCAB_SIZE", "8192"))  # Reduced vocab fo
 L0_CONFIDENCE_THRESHOLD = float(os.environ.get("L0_CONFIDENCE_THRESHOLD", "0.7"))  # Use L0 when all probs >= this
 L0_SKIP_EAGLE = os.environ.get("L0_SKIP_EAGLE", "1") == "1"  # Skip EAGLE entirely when L0 confident
 
+# ============================================================================
+# BABY EAGLE INTEGRATION - Tiny draft model that fits in L2 cache
+# ============================================================================
+BABY_EAGLE_ENABLED = os.environ.get("BABY_EAGLE_ENABLED", "0") == "1"
+BABY_EAGLE_CHECKPOINT = os.environ.get("BABY_EAGLE_CHECKPOINT", "/workspace/lager/projects/baby_eagle/checkpoints_v2/best.pt")
+BABY_EAGLE_VOCAB_SIZE = int(os.environ.get("BABY_EAGLE_VOCAB_SIZE", "8000"))
+
 
 def create_linear_verify_input(
     l0_tokens: torch.Tensor,
@@ -272,6 +279,169 @@ class L0CudaGraphRunner:
             with torch.no_grad():
                 tokens, _ = self.l0_model.draft_k_tokens(hidden_states, self.k)
             return tokens
+
+# ============================================================================
+# BABY EAGLE - Tiny draft model (~19M params, fits in L2 cache)
+# ============================================================================
+
+class TinyTransformerLayer(nn.Module):
+    """Minimal transformer layer for Baby EAGLE."""
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+
+        self.gate_proj = nn.Linear(dim, dim * 4, bias=False)
+        self.up_proj = nn.Linear(dim, dim * 4, bias=False)
+        self.down_proj = nn.Linear(dim * 4, dim, bias=False)
+
+        self.norm1 = nn.RMSNorm(dim, eps=1e-5)
+        self.norm2 = nn.RMSNorm(dim, eps=1e-5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        residual = x
+        x = self.norm1(x)
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, self.dim)
+        x = residual + self.o_proj(out)
+
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return x
+
+
+class TinyEagleModel(nn.Module):
+    """Tiny EAGLE model optimized for L2 cache residency (~19M params, 35.6 MB)."""
+
+    def __init__(self, target_hidden_size: int = 4096, internal_dim: int = 512,
+                 num_layers: int = 2, num_heads: int = 8, draft_vocab_size: int = 8000):
+        super().__init__()
+        self.target_hidden_size = target_hidden_size
+        self.internal_dim = internal_dim
+        self.draft_vocab_size = draft_vocab_size
+
+        self.input_proj = nn.Linear(target_hidden_size, internal_dim, bias=False)
+        self.embed_tokens = nn.Embedding(draft_vocab_size, internal_dim)
+        self.layers = nn.ModuleList([
+            TinyTransformerLayer(internal_dim, num_heads) for _ in range(num_layers)
+        ])
+        self.norm = nn.RMSNorm(internal_dim, eps=1e-5)
+        self.lm_head = nn.Linear(internal_dim, draft_vocab_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, draft_token_ids: torch.Tensor = None) -> torch.Tensor:
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+        x = self.input_proj(hidden_states)
+        if draft_token_ids is not None:
+            tok_emb = self.embed_tokens(draft_token_ids)
+            x = torch.cat([x, tok_emb], dim=1)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return self.lm_head(x)
+
+
+class BabyEagleCudaGraphRunner:
+    """CUDA Graph runner for Baby EAGLE - generates k draft tokens."""
+
+    def __init__(self, model: TinyEagleModel, hidden_dim: int, k: int, device: str):
+        self.model = model
+        self.hidden_dim = hidden_dim
+        self.k = k
+        self.device = device
+        self.vocab_size = model.draft_vocab_size
+
+        # Static buffers
+        self.static_hidden = torch.zeros(1, hidden_dim, dtype=torch.float16, device=device)
+        self.static_tokens = None
+        self.graphs = []
+        self.graph_outputs = []
+
+        self._capture_graphs()
+
+    def _capture_graphs(self):
+        """Capture CUDA graphs for tree-style drafting."""
+        stream = torch.cuda.Stream()
+
+        # For simplicity, generate k tokens autoregressively with graphs
+        for i in range(self.k):
+            # Warmup
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    with torch.no_grad():
+                        if i == 0:
+                            _ = self.model(self.static_hidden)
+                        else:
+                            tok = torch.zeros(1, 1, dtype=torch.long, device=self.device)
+                            _ = self.model(self.static_hidden, tok)
+            torch.cuda.synchronize()
+
+            # Capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                with torch.no_grad():
+                    if i == 0:
+                        out = self.model(self.static_hidden)
+                    else:
+                        tok = torch.zeros(1, 1, dtype=torch.long, device=self.device)
+                        out = self.model(self.static_hidden, tok)
+
+            self.graphs.append(graph)
+            self.graph_outputs.append(out)
+
+        torch.cuda.synchronize()
+        num_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"Baby EAGLE CUDA graphs captured: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB), K={self.k}")
+
+    def run(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Generate k draft tokens using CUDA graphs."""
+        if hidden_states.shape[0] != 1:
+            # Fallback to eager for batch > 1
+            return self._run_eager(hidden_states)
+
+        self.static_hidden.copy_(hidden_states)
+        tokens = []
+
+        for i in range(self.k):
+            self.graphs[i].replay()
+            logits = self.graph_outputs[i][:, -1, :]
+            tok = logits.argmax(dim=-1)
+            tokens.append(tok)
+
+        return torch.stack(tokens, dim=1)  # [1, k]
+
+    def _run_eager(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Fallback for batch > 1."""
+        batch_size = hidden_states.shape[0]
+        tokens = []
+        with torch.no_grad():
+            logits = self.model(hidden_states)
+            tok = logits[:, -1, :].argmax(dim=-1)
+            tokens.append(tok)
+            for _ in range(self.k - 1):
+                logits = self.model(hidden_states, tok.unsqueeze(1))
+                tok = logits[:, -1, :].argmax(dim=-1)
+                tokens.append(tok)
+        return torch.stack(tokens, dim=1)
 
 # ============================================================================
 
@@ -466,6 +636,47 @@ class EAGLEWorker(TpModelWorker):
                 self.l0_model = None
         # ==========================================
 
+        # ============= BABY EAGLE INTEGRATION =============
+        self.baby_eagle_model = None
+        self.baby_eagle_graph_runner = None
+        self.baby_eagle_k = L0_K  # Use same K as L0 for now
+        self._baby_eagle_capturing = False
+
+        if BABY_EAGLE_ENABLED:
+            try:
+                hidden_dim = self.target_worker.model_runner.model_config.hidden_size
+                self.baby_eagle_model = TinyEagleModel(
+                    target_hidden_size=hidden_dim,
+                    internal_dim=512,
+                    num_layers=2,
+                    num_heads=8,
+                    draft_vocab_size=BABY_EAGLE_VOCAB_SIZE,
+                ).to(self.device).half().eval()
+                self._baby_eagle_hidden_dim = hidden_dim
+
+                # Load trained weights if checkpoint exists
+                if os.path.exists(BABY_EAGLE_CHECKPOINT):
+                    checkpoint = torch.load(BABY_EAGLE_CHECKPOINT, map_location=self.device, weights_only=False)
+                    if 'model_state_dict' in checkpoint:
+                        state_dict = checkpoint['model_state_dict']
+                    else:
+                        state_dict = checkpoint
+                    missing, unexpected = self.baby_eagle_model.load_state_dict(state_dict, strict=False)
+                    logger.info(f"Baby EAGLE model loaded from {BABY_EAGLE_CHECKPOINT}")
+                    if missing:
+                        logger.info(f"  Missing keys (initialized randomly): {missing}")
+                else:
+                    logger.warning(f"Baby EAGLE checkpoint not found: {BABY_EAGLE_CHECKPOINT} - using random weights")
+
+                num_params = sum(p.numel() for p in self.baby_eagle_model.parameters())
+                logger.info(f"Baby EAGLE model: {num_params:,} params ({num_params * 2 / 1024 / 1024:.1f} MB), hidden_dim={hidden_dim}, vocab={BABY_EAGLE_VOCAB_SIZE}, K={self.baby_eagle_k}")
+            except Exception as e:
+                logger.warning(f"Baby EAGLE initialization failed: {e}")
+                import traceback
+                traceback.print_exc()
+                self.baby_eagle_model = None
+        # ==========================================
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
@@ -525,6 +736,21 @@ class EAGLEWorker(TpModelWorker):
             except Exception as e:
                 logger.warning(f"L0 CUDA graph capture failed: {e}")
                 self.l0_graph_runner = None
+
+        # Capture Baby EAGLE CUDA graphs
+        self._baby_eagle_capturing = False
+        if self.baby_eagle_model is not None:
+            try:
+                self.baby_eagle_graph_runner = BabyEagleCudaGraphRunner(
+                    self.baby_eagle_model,
+                    self._baby_eagle_hidden_dim,
+                    self.baby_eagle_k,
+                    self.device,
+                )
+                logger.info("Baby EAGLE CUDA graph captured - Baby EAGLE enabled for inference")
+            except Exception as e:
+                logger.warning(f"Baby EAGLE CUDA graph capture failed: {e}")
+                self.baby_eagle_graph_runner = None
 
     @property
     def draft_model_runner(self):
@@ -804,6 +1030,50 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+
+        # ============= BABY EAGLE INTEGRATION (zero overhead - always use Baby EAGLE) =============
+        if hasattr(self, 'baby_eagle_graph_runner') and self.baby_eagle_graph_runner is not None and BABY_EAGLE_ENABLED:
+            spec_info_inner = forward_batch.spec_info
+            hidden_states = getattr(spec_info_inner, 'hidden_states', None)
+            if hidden_states is not None and not self._baby_eagle_capturing and not batch.forward_mode.is_idle():
+                # Run Baby EAGLE - CUDA graph accelerated
+                baby_eagle_tokens = self.baby_eagle_graph_runner.run(hidden_states)
+
+                # Clamp to draft vocab
+                baby_eagle_tokens = torch.clamp(baby_eagle_tokens, 0, BABY_EAGLE_VOCAB_SIZE - 1)
+
+                (
+                    tree_mask,
+                    position,
+                    retrive_index,
+                    retrive_next_token,
+                    retrive_next_sibling,
+                    draft_tokens,
+                ) = create_linear_verify_input(
+                    baby_eagle_tokens,
+                    spec_info.verified_id,
+                    batch.seq_lens,
+                    batch.seq_lens_sum,
+                    self.speculative_num_draft_tokens,
+                    self.device,
+                )
+
+                return EagleVerifyInput(
+                    draft_token=draft_tokens,
+                    custom_mask=tree_mask,
+                    positions=position,
+                    retrive_index=retrive_index,
+                    retrive_next_token=retrive_next_token,
+                    retrive_next_sibling=retrive_next_sibling,
+                    retrive_cum_len=None,
+                    spec_steps=self.speculative_num_steps,
+                    topk=self.topk,
+                    draft_token_num=self.speculative_num_draft_tokens,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
+        # ===========================================================
 
         # ============= L0 INTEGRATION (zero overhead - always use L0) =============
         if hasattr(self, 'l0_graph_runner') and self.l0_graph_runner is not None and L0_SKIP_EAGLE:
