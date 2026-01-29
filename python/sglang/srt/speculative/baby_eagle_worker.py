@@ -12,7 +12,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, alloc_for_decode
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 
@@ -86,27 +87,76 @@ class BabyEagleWorker:
         """Clear any cached state."""
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
         """
-        Main entry point for speculative decoding.
+        Main entry point for speculative decoding (v1 interface like NGRAM).
 
         Note: Full integration requires hidden state capture from target model.
-        This is a placeholder for the scheduler interface.
+        Currently operates in pass-through mode (no speculation).
         """
-        model_worker_batch = batch.get_model_worker_batch()
-
-        if model_worker_batch.forward_mode.is_extend():
+        if batch.forward_mode.is_extend():
             # Prefill: just run target model
-            return self.target_worker.forward_batch_generation(model_worker_batch)
+            model_worker_batch = batch.get_model_worker_batch()
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
+            return GenerationBatchResult(
+                logits_output=batch_result.logits_output,
+                next_token_ids=batch_result.next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                accept_lens=None,
+            )
 
-        # For decode, would need to:
-        # 1. Get hidden states from target model
-        # 2. Get KV cache from target layer 16
-        # 3. Run Baby EAGLE draft
-        # 4. Verify with target
+        # For decode: pass-through mode (no speculation yet)
+        # The scheduler skips prepare_for_decode() when spec_algorithm is set,
+        # so we must complete the preparation manually for pass-through mode.
+        self._prepare_decode_batch(batch)
 
-        # For now, fall back to target
-        return self.target_worker.forward_batch_generation(model_worker_batch)
+        model_worker_batch = batch.get_model_worker_batch()
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch
+        )
+        return GenerationBatchResult(
+            logits_output=batch_result.logits_output,
+            next_token_ids=batch_result.next_token_ids,
+            num_accepted_tokens=0,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            accept_lens=None,
+        )
+
+    def _prepare_decode_batch(self, batch: ScheduleBatch):
+        """Prepare batch for vanilla decode (no speculation).
+
+        This completes the preparation that prepare_for_decode() skips
+        when spec_algorithm is set.
+        """
+        # Handle penalizer if needed
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                batch.output_ids.to(torch.int64)
+            )
+
+        # Set input_ids to last output tokens
+        batch.input_ids = batch.output_ids
+        batch.output_ids = None
+
+        # Allocate memory for decode
+        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+
+        # Update req-level fields
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
+
+        # Update seq_lens
+        batch.seq_lens += 1
+        batch.seq_lens_cpu += 1
+        batch.orig_seq_lens += 1
+        batch.seq_lens_sum = batch.seq_lens.sum().item()
 
     def draft(
         self,

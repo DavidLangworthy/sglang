@@ -51,6 +51,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
+        # Note: Baby EAGLE uses simpler v1 interface like NGRAM
         return self.is_eagle() or self.is_standalone()
 
     def create_worker(
