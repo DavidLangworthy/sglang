@@ -17,6 +17,7 @@ class SpeculativeAlgorithm(Enum):
 
     EAGLE = auto()
     EAGLE3 = auto()
+    BABY_EAGLE = auto()  # Tiny draft model (~19M params) for L2 cache residency
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
@@ -39,6 +40,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
+
+    def is_baby_eagle(self) -> bool:
+        return self == SpeculativeAlgorithm.BABY_EAGLE
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -92,6 +96,14 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_baby_eagle():
+            # Baby EAGLE: tiny draft model (~19M params) for L2 cache residency
+            # TODO: Move 4 - integrate BabyEagleWorker
+            raise NotImplementedError(
+                "Baby EAGLE worker integration pending (Move 4). "
+                "Use EAGLE3 for now."
+            )
+
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
