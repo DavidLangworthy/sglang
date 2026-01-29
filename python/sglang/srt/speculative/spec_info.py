@@ -98,11 +98,10 @@ class SpeculativeAlgorithm(Enum):
             return StandaloneWorker
         elif self.is_baby_eagle():
             # Baby EAGLE: tiny draft model (~19M params) for L2 cache residency
-            # TODO: Move 4 - integrate BabyEagleWorker
-            raise NotImplementedError(
-                "Baby EAGLE worker integration pending (Move 4). "
-                "Use EAGLE3 for now."
-            )
+            # Uses EAGLE's infrastructure but with a tiny model
+            from sglang.srt.speculative.baby_eagle_worker import BabyEagleWorker
+
+            return BabyEagleWorker
 
         elif self.is_ngram():
             if enable_overlap:
