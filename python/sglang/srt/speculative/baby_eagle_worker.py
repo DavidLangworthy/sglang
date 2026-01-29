@@ -91,11 +91,56 @@ class BabyEagleWorker:
         import os
         self.kv_layer_idx = int(os.environ.get("BABY_EAGLE_KV_LAYER", "16"))
 
+        # Configure target model to capture PRE-norm hidden states from the KV layer
+        # This is critical - Baby EAGLE was trained on PRE-norm states
+        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
+            self.model_runner.model.set_eagle3_layers_to_capture([self.kv_layer_idx])
+            logger.info(f"Configured target model to capture PRE-norm hidden states from layer {self.kv_layer_idx}")
+        else:
+            logger.warning(f"Target model does not support set_eagle3_layers_to_capture - hidden states may be POST-norm!")
+
         logger.info(f"Baby EAGLE worker initialized with {self.num_draft_tokens} draft tokens, KV layer={self.kv_layer_idx}")
 
     def clear_cache_pool(self):
         """Clear any cached state."""
         pass
+
+    def _extract_prenorm_hidden_states(self, batch_result, batch_size: int):
+        """
+        Extract PRE-norm hidden states from aux_hidden_states.
+
+        Returns tensor of shape [batch_size, hidden_dim] with PRE-norm states from kv_layer_idx.
+        Falls back to POST-norm final hidden states if aux states not available.
+        """
+        hidden_states_output = batch_result.logits_output.hidden_states
+
+        # Check if we got aux_hidden_states (tuple return)
+        if isinstance(hidden_states_output, tuple) and len(hidden_states_output) == 2:
+            final_hidden_states, aux_hidden_states = hidden_states_output
+
+            # aux_hidden_states is a list, one entry per captured layer
+            # We configured to capture self.kv_layer_idx, so it should be the first (and only) entry
+            if len(aux_hidden_states) > 0:
+                # Take the last token's hidden state from the captured layer
+                prenorm_states = aux_hidden_states[0]  # [batch, seq_len, hidden_dim]
+                # Get last token for each request
+                if prenorm_states.dim() == 3:
+                    prenorm_states = prenorm_states[:, -1, :]  # [batch, hidden_dim]
+
+                logger.debug(f"Extracted PRE-norm hidden states from layer {self.kv_layer_idx}, shape={prenorm_states.shape}")
+                return prenorm_states
+            else:
+                logger.warning("aux_hidden_states is empty! Falling back to POST-norm states")
+
+        # Fallback: use final POST-norm hidden states
+        if hidden_states_output is not None:
+            if isinstance(hidden_states_output, tuple):
+                hidden_states_output = hidden_states_output[0]  # Extract final states
+
+            logger.debug(f"Using POST-norm final hidden states (shape={hidden_states_output.shape})")
+            return hidden_states_output
+
+        return None
 
     def forward_batch_generation(
         self, batch: ScheduleBatch
@@ -115,13 +160,13 @@ class BabyEagleWorker:
                 model_worker_batch
             )
 
-            # Store hidden states for each request (for next decode step)
-            if batch_result.logits_output.hidden_states is not None:
-                hidden_states = batch_result.logits_output.hidden_states
+            # Store PRE-norm hidden states for each request (for next decode step)
+            hidden_states = self._extract_prenorm_hidden_states(batch_result, len(batch.reqs))
+            if hidden_states is not None:
                 for i, req in enumerate(batch.reqs):
                     if i < hidden_states.shape[0]:
                         self.hidden_state_cache[req.rid] = hidden_states[i:i+1].clone()
-                logger.debug(f"Prefill: captured hidden states for {len(batch.reqs)} reqs, shape={hidden_states.shape}")
+                logger.debug(f"Prefill: captured PRE-norm hidden states for {len(batch.reqs)} reqs, shape={hidden_states.shape}")
 
             return GenerationBatchResult(
                 logits_output=batch_result.logits_output,
@@ -150,9 +195,9 @@ class BabyEagleWorker:
             model_worker_batch
         )
 
-        # Update hidden state cache
-        if batch_result.logits_output.hidden_states is not None:
-            hidden_states = batch_result.logits_output.hidden_states
+        # Update PRE-norm hidden state cache
+        hidden_states = self._extract_prenorm_hidden_states(batch_result, len(batch.reqs))
+        if hidden_states is not None:
             for i, req in enumerate(batch.reqs):
                 if i < hidden_states.shape[0]:
                     self.hidden_state_cache[req.rid] = hidden_states[i:i+1].clone()
@@ -250,9 +295,9 @@ class BabyEagleWorker:
             model_worker_batch
         )
 
-        # Update hidden state cache
-        if batch_result.logits_output.hidden_states is not None:
-            hidden_states = batch_result.logits_output.hidden_states
+        # Update PRE-norm hidden state cache
+        hidden_states = self._extract_prenorm_hidden_states(batch_result, len(batch.reqs))
+        if hidden_states is not None:
             for i, req in enumerate(batch.reqs):
                 if i < hidden_states.shape[0]:
                     self.hidden_state_cache[req.rid] = hidden_states[i:i+1].clone()
