@@ -2332,6 +2332,30 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "BABY_EAGLE":
+            if not self.device.startswith("cuda"):
+                raise ValueError(
+                    "Baby EAGLE speculative decoding only supports CUDA device."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            # Baby EAGLE uses linear drafting (no tree), set topk=1
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+
+            # Set num_draft_tokens from num_steps if not specified
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = self.speculative_num_steps or 3
+
+            logger.info(
+                f"Baby EAGLE initialized with {self.speculative_num_draft_tokens} draft tokens, topk={self.speculative_eagle_topk}"
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
