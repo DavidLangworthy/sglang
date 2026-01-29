@@ -2344,6 +2344,10 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
+            # Baby EAGLE uses v1 interface (like NGRAM), disable overlap scheduling
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+
             # Baby EAGLE uses linear drafting (no tree), set topk=1
             if self.speculative_eagle_topk is None:
                 self.speculative_eagle_topk = 1
@@ -2354,6 +2358,9 @@ class ServerArgs:
 
             logger.info(
                 f"Baby EAGLE initialized with {self.speculative_num_draft_tokens} draft tokens, topk={self.speculative_eagle_topk}"
+            )
+            logger.warning(
+                "Overlap scheduler and mixed chunked prefill are disabled for Baby EAGLE (uses v1 interface)."
             )
 
     def _handle_load_format(self):
