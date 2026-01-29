@@ -247,9 +247,14 @@ def load_baby_eagle_checkpoint(
     Uses the original BabyEagle model class from model.py to ensure
     architecture compatibility with trained weights.
     """
-    # Import original model
+    # Import original model and TrainConfig (needed for unpickling checkpoint)
     try:
         from model import BabyEagle, BabyEagleConfig
+        # TrainConfig is pickled in checkpoint, need to import before torch.load
+        try:
+            from train import TrainConfig
+        except ImportError:
+            pass  # TrainConfig not needed if checkpoint doesn't have it
         logger.info("Successfully imported BabyEagle from model.py")
     except ImportError as e:
         logger.error(f"Failed to import BabyEagle model: {e}")
